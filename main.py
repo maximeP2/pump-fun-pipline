@@ -61,7 +61,7 @@ async def main():
 
         # Lancer le monitor pour ce token
         asyncio.create_task(
-            monitor_project(project, out_queue=monitored_data_queue,debug=DEBUG)
+            monitor_project(project, out_queue=monitored_data_queue,debug=True)
         )
 
         # await asyncio.sleep(1)

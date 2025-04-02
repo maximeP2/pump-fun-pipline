@@ -5,7 +5,7 @@ import time
 import struct
 import aiohttp
 import websockets
-from collections import deque
+from collections import deque, defaultdict
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey
 from config import PUMP_PROGRAM, LAMPORTS_PER_SOL
@@ -20,6 +20,12 @@ SELL_DISCRIMINATOR = struct.pack("<Q", 12502976635542562355)
 EXPECTED_DISCRIMINATOR = struct.pack("<Q", 6966180631402821399)
 TOKEN_DECIMALS = 6
 
+def log(msg, debug=True):
+    if debug:
+        print(f"[DEBUG] {msg}")
+
+
+# === Bonding Curve Parsing ===
 class BondingCurveState:
     _STRUCT = Struct(
         "virtual_token_reserves" / Int64ul,
@@ -79,14 +85,7 @@ def avg_price(history):
     total_tokens = sum(tokens for _, tokens in history)
     return total_sol / total_tokens if total_tokens > 0 else None
 
-
-from collections import defaultdict
-
 def update_aggregate_per_second(state_map, key, timestamp, value):
-    """
-    Incrémente la somme par seconde de manière robuste dans state_map.
-    Crée automatiquement des zéros pour les secondes manquantes.
-    """
     sec = int(timestamp)
     agg_key = f"agg_{key}_per_sec"
     last_key = f"last_agg_ts_{key}"
@@ -96,14 +95,12 @@ def update_aggregate_per_second(state_map, key, timestamp, value):
         state_map[last_key] = sec - 1
 
     if sec not in state_map[agg_key]:
-        # Ajout de zéros pour toutes les secondes manquantes
         last_sec = state_map[last_key]
         for missing in range(last_sec + 1, sec):
             state_map[agg_key][missing] = 0.0
 
     state_map[agg_key][sec] = state_map[agg_key].get(sec, 0.0) + value
     state_map[last_key] = sec
-
 
 def is_rising(series):
     return all(x <= y for x, y in zip(series, series[1:]))
@@ -124,11 +121,7 @@ def check_aggregated_momentum(state_map, min_points=5, max_age_sec=7):
     if not all([prices, buyers, volumes]):
         return False
 
-    return all(x <= y for x, y in zip(prices, prices[1:])) and \
-           all(x <= y for x, y in zip(buyers, buyers[1:])) and \
-           all(x <= y for x, y in zip(volumes, volumes[1:]))
-
-
+    return is_rising(prices) and is_rising(buyers) and is_rising(volumes)
 
 async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, debug=False):
     thresholds = thresholds or {
@@ -164,11 +157,13 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
             try:
                 if attempt > 0:
                     await asyncio.sleep(1)
+                    log(f"🔁 Retrying fetch for bonding curve {project['name']} ({mint})...", debug)
                 raw = await get_account_data(session, bonding_curve)
                 curve_state = parse_bonding_curve(raw)
                 initial_price = calculate_price(curve_state)
                 state_map["price"] = initial_price
                 state_map["price_history"].append((time.time(), initial_price))
+                log(f"✅ Initial price for {project['name']} ({mint}): {initial_price:.6f} SOL", debug)
                 break
             except Exception as e:
                 if attempt == 1:
@@ -180,12 +175,15 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
             await asyncio.sleep(0.5)
             now = time.time()
             if now - start_time >= 10 and state_map["holder_count"] == 0:
+                log(f"💀 {project['name']} ({mint}) - No holders after 10s", debug)
                 should_exit.set(); return
             if now - start_time >= thresholds["holder_check_sec"] and state_map["holder_count"] < thresholds["min_holders"]:
+                log(f"⛔ {project['name']} ({mint}) - Not enough holders after {thresholds['holder_check_sec']}s", debug)
                 should_exit.set(); return
             if now - start_time >= thresholds["price_check_sec"]:
                 expected = state_map["price_history"][0][1] * (1 + thresholds["price_min_increase"])
                 if state_map["price"] < expected:
+                    log(f"📉 {project['name']} ({mint}) - Price hasn't risen enough", debug)
                     should_exit.set(); return
             if check_aggregated_momentum(state_map):
                 print(f"🚀 STRATEGY MATCHED: {project['name']} {mint}")
@@ -202,10 +200,17 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
                 "method": "blockSubscribe",
                 "params": [
                     {"mentionsAccountOrProgram": str(PUMP_PROGRAM)},
-                    {"commitment": "confirmed", "encoding": "base64", "transactionDetails": "full", "maxSupportedTransactionVersion": 0}
+                    {
+                        "commitment": "confirmed",
+                        "encoding": "base64",
+                        "transactionDetails": "full",
+                        "maxSupportedTransactionVersion": 0
+                    }
                 ]
             }))
+            log(f"📡 Subscribed to stream for {project['name']}", debug)
             last_ping = time.time()
+
             while not should_exit.is_set():
                 if time.time() - last_ping > 20:
                     await ws.ping(); last_ping = time.time()
@@ -222,8 +227,10 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
                             tx_bytes = base64.b64decode(tx["transaction"][0])
                             if not any(d in tx_bytes for d in [BUY_DISCRIMINATOR, SELL_DISCRIMINATOR]):
                                 continue
+
                             transaction = VersionedTransaction.from_bytes(tx_bytes)
                             keys = transaction.message.account_keys
+
                             for ix in transaction.message.instructions:
                                 discriminator = ix.data[:8]
                                 if discriminator not in [BUY_DISCRIMINATOR, SELL_DISCRIMINATOR]: continue
@@ -237,32 +244,59 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
 
                                 state_map["tx_count"] += 1
                                 update_aggregate_per_second(state_map, "tx_count", timestamp, 1)
+                                log(f"🔁 TX at {sec}s for {project['name']} ({mint})", debug)
 
+                                if "balances" not in state_map:
+                                    state_map["balances"] = {}
+
+                                # --- BUY ---
                                 if discriminator == BUY_DISCRIMINATOR:
-                                    state_map["buyers"].add(actor)
                                     try:
                                         token_amount = struct.unpack_from("<Q", ix.data, 8)[0] / 10**TOKEN_DECIMALS
                                         sol_amount = struct.unpack_from("<Q", ix.data, 16)[0] / LAMPORTS_PER_SOL
                                         if token_amount > 0:
+                                            prev = state_map["balances"].get(actor, 0)
+                                            new = prev + token_amount
+                                            state_map["balances"][actor] = new
+                                            if prev == 0:
+                                                state_map["holder_count"] += 1
+                                                log(f"👤 New holder (+1) {project['name']} → total: {state_map['holder_count']}", debug)
+
                                             state_map["buy_history"].append((sol_amount, token_amount))
                                             state_map["volume_history"].append((timestamp, sol_amount))
                                             update_aggregate_per_second(state_map, "volume", timestamp, sol_amount)
                                             update_aggregate_per_second(state_map, "buyers", timestamp, 1)
-                                    except Exception:
-                                        pass
+                                            log(f"🟢 Buy {sol_amount:.6f} SOL | {token_amount:.6f} tokens", debug)
+                                    except Exception as e:
+                                        log(f"[⚠️] Buy decode failed: {e}", debug)
 
+                                # --- SELL ---
                                 elif discriminator == SELL_DISCRIMINATOR:
-                                    state_map["sellers"].add(actor)
+                                    try:
+                                        token_amount = struct.unpack_from("<Q", ix.data, 8)[0] / 10**TOKEN_DECIMALS
+                                        sol_amount = struct.unpack_from("<Q", ix.data, 16)[0] / LAMPORTS_PER_SOL
+                                        if token_amount > 0:
+                                            prev = state_map["balances"].get(actor, 0)
+                                            new = max(prev - token_amount, 0)
+                                            state_map["balances"][actor] = new
+                                            if prev > 0 and new == 0:
+                                                state_map["holder_count"] = max(state_map["holder_count"] - 1, 0)
+                                                log(f"👤 Holder exited (-1) {project['name']} → total: {state_map['holder_count']}", debug)
 
-                                state_map["holder_count"] = len(state_map["buyers"] - state_map["sellers"])
-                                state_map["buyer_history"].append((timestamp, len(state_map["buyers"])))
+                                            state_map["sell_history"].append((timestamp, token_amount))
+                                            update_aggregate_per_second(state_map, "sellers", timestamp, 1)
+                                            update_aggregate_per_second(state_map, "volume_sell", timestamp, sol_amount)
+                                            log(f"🔴 Sell {sol_amount:.6f} SOL | {token_amount:.6f} tokens", debug)
+                                    except Exception as e:
+                                        log(f"[⚠️] Sell decode failed: {e}", debug)
+
+                                state_map["buyer_history"].append((timestamp, len(state_map["balances"])))
 
                                 est_price = avg_price(state_map["buy_history"])
                                 if est_price:
                                     state_map["price_tx_estimate"] = est_price
                                     state_map["price_tx_history"].append((timestamp, est_price))
 
-                                # Récupération prix on-chain
                                 if 'last_curve_fetch' not in state_map or timestamp - state_map["last_curve_fetch"] > 1:
                                     state_map["last_curve_fetch"] = timestamp
                                     async with aiohttp.ClientSession() as s:
@@ -274,8 +308,9 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
                                                 state_map["price"] = new_price
                                                 state_map["price_history"].append((timestamp, new_price))
                                                 update_aggregate_per_second(state_map, "price", timestamp, new_price)
-                                        except Exception:
-                                            pass
+                                                log(f"📊 Price update: {new_price:.9f} SOL", debug)
+                                        except Exception as e:
+                                            log(f"[⚠️] Curve fetch failed: {e}", debug)
 
                                 await out_queue.put({
                                     "mint": mint,
@@ -284,13 +319,15 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
                                     "price_tx_estimate": state_map["price_tx_estimate"],
                                     "holders": state_map["holder_count"],
                                     "tx_count": state_map["tx_count"],
-                                    "buyers": list(state_map["buyers"]),
-                                    "sellers": list(state_map["sellers"]),
+                                    "buyers": list(state_map["balances"].keys()),
+                                    "sellers": list(state_map.get("sellers", set())),
                                     "project": project
                                 })
 
-                        except Exception:
+                        except Exception as e:
+                            log(f"[⚠️] TX processing failed: {e}", debug)
                             continue
+
                 except asyncio.TimeoutError:
                     await ws.ping()
                     last_ping = time.time()
@@ -298,3 +335,5 @@ async def monitor_project(project, out_queue: asyncio.Queue, thresholds=None, de
         print(f"[❌] WebSocket closed unexpectedly for {mint}: {websocket_error}")
         await asyncio.sleep(1)
         return
+
+

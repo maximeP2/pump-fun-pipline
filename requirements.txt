@@ -1,0 +1,8 @@
+# borsh-construct
+# construct
+# construct-typing
+construct
+solders
+websockets
+aiohttp
+python-dotenv

@@ -1,0 +1,4 @@
+.private
+logs/*
+__pycache__
+venv
